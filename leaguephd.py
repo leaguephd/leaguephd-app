@@ -7,6 +7,7 @@ from asyncqt import QEventLoop, QThreadExecutor
 from PyQt5.QtWidgets import QApplication, QMainWindow, QStatusBar, QLabel
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtCore import QUrl
+from PyQt5.QtGui import QIcon
 from lcu_driver import Connector
 from ChampSelect import ChampSelect
 
@@ -14,7 +15,6 @@ from ChampSelect import ChampSelect
 class MainWindow(QMainWindow):
     def __init__(self, logger=None):
         super(MainWindow, self).__init__()
-        self.exit_request = asyncio.Event()
 
         self.setWindowTitle("League PhD")
 
@@ -46,8 +46,7 @@ class MainWindow(QMainWindow):
         # logger
         self.logger = logger
 
-    def closeEvent(self, *args):
-        self.exit_request.set()
+        self.setWindowIcon(QIcon('assets/icon.ico'))
 
     def call_update(self, result_dict, dict_updated):
         self.logger.info('sent a call')
