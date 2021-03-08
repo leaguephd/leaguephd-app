@@ -3,12 +3,12 @@ import argparse
 import json
 import logging
 import requests
-import sys
-from asyncqt import QEventLoop, QThreadExecutor
+from pathlib import Path
+from qasync import QEventLoop, QThreadExecutor
 from PyQt5.QtWidgets import QApplication, QMainWindow, QStatusBar, QLabel
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtCore import QUrl
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import QIcon, QDesktopServices
 from lcu_driver import Connector
 from ChampSelect import ChampSelect
 
@@ -47,7 +47,7 @@ class MainWindow(QMainWindow):
         # logger
         self.logger = logger
 
-        self.setWindowIcon(QIcon('assets/icon.ico'))
+        self.setWindowIcon(QIcon(str(Path('assets/icon.ico'))))
 
     def call_update(self, result_dict, dict_updated):
         self.logger.info('sent a call')
@@ -55,6 +55,11 @@ class MainWindow(QMainWindow):
         self.web_view.page().runJavaScript(f'app_call({json.dumps(result_dict)});')
 
     def go_to_pick_now(self):
+        try:
+            self.web_view.page_loaded._loop.call_soon_threadsafe(self.web_view.page_loaded.set)
+        except AttributeError:
+            pass
+
         self.logger.info('redirect to pick now')
         self.web_view.page().runJavaScript(f'go_to_pick_now();')
 
@@ -74,13 +79,40 @@ class MainWindow(QMainWindow):
 class WebView(QWebEngineView):
     def __init__(self, parent):
         super(WebView, self).__init__(parent)
+
+        self.page_loaded = None
         self.base_url = QUrl("https://www.leaguephd.com/stats/pick-now/")
         self.load(self.base_url)
+        self.loadFinished.connect(self.onLoadFinished)
+
+    def onLoadFinished(self):
+        try:
+            self.page_loaded._loop.call_soon_threadsafe(self.page_loaded.set)
+        except AttributeError:
+            pass
+
+    def createWindow(self, _type):
+        webview = WebView(self.parent())
+        webview.urlChanged.connect(self.open_browser)
+        return webview
+
+    def open_browser(self, url):
+        webview = self.sender()
+        QDesktopServices.openUrl(url)
+        webview.deleteLater()
+
+    def is_pick_now(self):
+        # check if the current page is Pick Now
+        return self.url().path().rsplit('/', 2)[1] == 'pick-now'
 
 
 def working():
     work_loop = asyncio.new_event_loop()
     connector = Connector(loop=work_loop)
+
+    # to make sure the page has been loaded before running a JS script
+    page_loaded = asyncio.Event(loop=work_loop)
+    window.web_view.page_loaded = page_loaded
 
     # fired when LCU API is ready to be used
     @connector.ready
@@ -89,14 +121,20 @@ def working():
         window.status_bar.showMessage("Connected to the League client")
 
         # check whether session is in place
-        session = await connection.request('get', '/lol-champ-select/v1/session')
-        if session.status == 200:
+        resp = await connection.request('get', '/lol-champ-select/v1/session')
+        await page_loaded.wait()
+        if resp.status == 200:
+            data = await resp.json()
             logger.info("session is already in place")
-            logger.info(json.dumps(session.data))
+            logger.info(data)
 
-            window.go_to_pick_now()
+            if not window.web_view.is_pick_now():
+                window.go_to_pick_now()
+                await page_loaded.wait()
+
             champselect.reset()
-            updated, dict_updated = champselect.update(session.data)
+            updated, dict_updated = champselect.update(data)
+            logger.info(champselect)
             if updated:
                 window.call_update(champselect.__repr__(), dict_updated)
         else:
@@ -108,7 +146,6 @@ def working():
         logger.info('The client have been closed!')
         window.status_bar.showMessage("Waiting for a connection...")
         await connector.stop()
-        sys.exit()
 
     # subscribe to '/lol-summoner/v1/session' endpoint
     @connector.ws.register('/lol-champ-select/v1/session', event_types=('CREATE', 'UPDATE', 'DELETE',))
@@ -119,10 +156,16 @@ def working():
 
             window.go_to_pick_now()
             champselect.reset()
-        elif event.type == 'Update':
-            logger.info(json.dumps(event.data))
+            await page_loaded.wait()
 
+        elif event.type == 'Update':
+            if not window.web_view.is_pick_now():
+                window.go_to_pick_now()
+                champselect.reset()
+
+            logger.info(json.dumps(event.data))
             updated, dict_updated = champselect.update(event.data)
+            await page_loaded.wait()
             if updated:
                 window.call_update(champselect.__repr__(), dict_updated)
 
@@ -146,7 +189,7 @@ if __name__ == '__main__':
     # logger
     logger = logging.getLogger()
     if args.debug:
-        hdlr = logging.FileHandler('logs/session.log')
+        hdlr = logging.FileHandler(Path('logs/session.log'))
         logger.addHandler(hdlr)
         logger.addHandler(logging.StreamHandler())
         logger.setLevel(logging.INFO)
@@ -160,7 +203,7 @@ if __name__ == '__main__':
     asyncio.set_event_loop(loop)
 
     window = MainWindow(logger=logger)
-    window.resize(1200, 850)
+    window.resize(1200, 930)
     window.show()
 
     try:
