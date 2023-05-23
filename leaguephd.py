@@ -145,7 +145,6 @@ def working():
     @connector.close
     async def disconnect(_):
         logger.info('The client have been closed!')
-        await connector.stop()
         sys.exit()
 
     # subscribe to '/lol-summoner/v1/session' endpoint
