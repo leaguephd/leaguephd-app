@@ -4,11 +4,11 @@ attrs==20.3.0
 certifi==2022.12.7
 chardet==3.0.4
 idna==2.10
-lcu-driver==2.1.3
+lcu-driver==3.0.0
 multidict==5.1.0
 psutil==5.8.0
 PyQt5==5.14.2
-PyQt5-sip==12.8.1
+PyQt5-sip==12.12.1
 PyQtWebEngine==5.14.0
 qasync==0.13.0
 requests==2.25.1

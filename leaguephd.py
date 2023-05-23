@@ -3,6 +3,7 @@ import argparse
 import json
 import logging
 import requests
+import sys
 from pathlib import Path
 from qasync import QEventLoop, QThreadExecutor
 from PyQt5.QtWidgets import QApplication, QMainWindow, QStatusBar, QLabel
@@ -144,8 +145,8 @@ def working():
     @connector.close
     async def disconnect(_):
         logger.info('The client have been closed!')
-        window.status_bar.showMessage("Waiting for a connection...")
         await connector.stop()
+        sys.exit()
 
     # subscribe to '/lol-summoner/v1/session' endpoint
     @connector.ws.register('/lol-champ-select/v1/session', event_types=('CREATE', 'UPDATE', 'DELETE',))
