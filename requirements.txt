@@ -13,5 +13,5 @@ PyQtWebEngine==5.14.0
 qasync==0.13.0
 requests==2.31.0
 typing-extensions==3.7.4.3
-urllib3==1.26.5
+urllib3==1.26.18
 yarl==1.6.3
