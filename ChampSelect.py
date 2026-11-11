@@ -75,6 +75,8 @@ class ChampSelect:
 
     def update(self, session):
         def map_assignedPosition_to_role(position):
+            if not position:
+                return None
             dict_position = {
                 'top': 'TOP',
                 'jungle': 'JGL',
@@ -84,7 +86,7 @@ class ChampSelect:
             }
 
             try:
-                return dict_position[position]
+                return dict_position[position.lower()]
             except KeyError:
                 return None
 
@@ -92,7 +94,7 @@ class ChampSelect:
             action_bans = []
             for action in actions:
                 for subaction in action:
-                    if subaction['type'] == 'ban':
+                    if subaction.get('type') == 'ban':
                         action_bans.append(subaction)
             return action_bans
 
@@ -100,7 +102,7 @@ class ChampSelect:
             action_picks = []
             for action in actions:
                 for subaction in action:
-                    if subaction['type'] == 'pick':
+                    if subaction.get('type') == 'pick':
                         action_picks.append(subaction)
             return action_picks
 
@@ -111,11 +113,15 @@ class ChampSelect:
             'to_pick_phase': False,
         }
 
+        actions = session.get('actions') or []
+        action_bans = get_action_bans(actions)
+
         if not self.active:
-            if not session['hasSimultaneousPicks']:
+            # Activate on any draft session (ranked/normal/custom with bans) or non-simultaneous picks
+            if not session.get('hasSimultaneousPicks', False) or len(action_bans) > 0:
                 self.active = True
 
-            if len(session['actions'][0]) == 10:
+            if actions and len(actions[0]) == 10:
                 # solo ranked/flex: start with 10 bans
                 self.draft_type = 'solo'
             else:
@@ -124,7 +130,8 @@ class ChampSelect:
         if self.active:
             # set my_side
             if self.my_side is None:
-                if session['localPlayerCellId'] <= 4:
+                local_cell_id = session.get('localPlayerCellId', 0)
+                if local_cell_id <= 4:
                     self.my_side = 0
                 else:
                     self.my_side = 1
@@ -132,16 +139,16 @@ class ChampSelect:
 
             # bans
             this_num_banned = 0
-            this_bans = self.bans
+            this_bans = list(self.bans)
             i_ban_blue = 0
             i_ban_red = 0
-            action_bans = get_action_bans(session['actions'])
             for action in action_bans:
                 action_side = 0 if action['actorCellId'] <= 4 else 1
                 if action['completed']:
                     ban_slot = i_ban_blue if action_side == 0 else 5 + i_ban_red
-                    this_bans[ban_slot] = action['championId']
-                    this_num_banned += 1
+                    if 0 <= ban_slot < 10:
+                        this_bans[ban_slot] = action['championId']
+                        this_num_banned += 1
 
                 if action_side == 0:
                     i_ban_blue += 1
@@ -156,7 +163,7 @@ class ChampSelect:
 
             # picks
             this_num_picked = 0
-            action_picks = get_action_picks(session['actions'])
+            action_picks = get_action_picks(actions)
 
             # check if pick phase has started
             if not self.has_pick_started:
@@ -168,31 +175,67 @@ class ChampSelect:
                         break
 
             if self.has_pick_started:
-                for action in action_picks:
-                    if action['completed']:
-                        this_num_picked += 1
+                my_team_by_cell = {m['cellId']: m for m in (session.get('myTeam') or []) if 'cellId' in m}
+                their_team_by_cell = {m['cellId']: m for m in (session.get('theirTeam') or []) if 'cellId' in m}
 
+                # 1) Process completed pick actions
+                for action in action_picks:
+                    if action['completed'] and action.get('championId', 0) > 0:
                         picks_team = 0 if action['actorCellId'] <= 4 else 1
                         picks_slot = action['actorCellId'] if action['actorCellId'] <= 4 else action['actorCellId'] - 5
-                        if self.picks[picks_team][picks_slot]['champion_id'] is None:
+                        if 0 <= picks_slot < 5 and self.picks[picks_team][picks_slot]['champion_id'] is None:
                             self.picks[picks_team][picks_slot]['champion_id'] = action['championId']
 
                             # update role if ally
-                            if action['isAllyAction']:
-                                if self.my_side == 0:
-                                    this_pick_myteam = session['myTeam'][action['actorCellId']]
-                                else:
-                                    this_pick_myteam = session['myTeam'][action['actorCellId'] - 5]
-                                self.picks[picks_team][picks_slot]['role'] = map_assignedPosition_to_role(
-                                    this_pick_myteam['assignedPosition'])
+                            if action.get('isAllyAction'):
+                                member = my_team_by_cell.get(action['actorCellId'])
+                                if member:
+                                    self.picks[picks_team][picks_slot]['role'] = map_assignedPosition_to_role(
+                                        member.get('assignedPosition'))
 
-                            # update dict_updated
                             dict_updated['insert_list'].append({
                                 'side': picks_team,
                                 'slot': picks_slot,
                                 'champion_id': self.picks[picks_team][picks_slot]['champion_id'],
                                 'role': self.picks[picks_team][picks_slot]['role']
                             })
+
+                # 2) Also process pre-assigned / bot / custom game champions from myTeam and theirTeam
+                for cell_id, member in my_team_by_cell.items():
+                    champ_id = member.get('championId', 0)
+                    if champ_id and champ_id > 0:
+                        picks_team = 0 if cell_id <= 4 else 1
+                        picks_slot = cell_id if cell_id <= 4 else cell_id - 5
+                        if 0 <= picks_slot < 5 and self.picks[picks_team][picks_slot]['champion_id'] is None:
+                            self.picks[picks_team][picks_slot]['champion_id'] = champ_id
+                            self.picks[picks_team][picks_slot]['role'] = map_assignedPosition_to_role(
+                                member.get('assignedPosition'))
+                            dict_updated['insert_list'].append({
+                                'side': picks_team,
+                                'slot': picks_slot,
+                                'champion_id': self.picks[picks_team][picks_slot]['champion_id'],
+                                'role': self.picks[picks_team][picks_slot]['role']
+                            })
+
+                for cell_id, member in their_team_by_cell.items():
+                    champ_id = member.get('championId', 0)
+                    if champ_id and champ_id > 0:
+                        picks_team = 0 if cell_id <= 4 else 1
+                        picks_slot = cell_id if cell_id <= 4 else cell_id - 5
+                        if 0 <= picks_slot < 5 and self.picks[picks_team][picks_slot]['champion_id'] is None:
+                            self.picks[picks_team][picks_slot]['champion_id'] = champ_id
+                            self.picks[picks_team][picks_slot]['role'] = map_assignedPosition_to_role(
+                                member.get('assignedPosition'))
+                            dict_updated['insert_list'].append({
+                                'side': picks_team,
+                                'slot': picks_slot,
+                                'champion_id': self.picks[picks_team][picks_slot]['champion_id'],
+                                'role': self.picks[picks_team][picks_slot]['role']
+                            })
+
+                this_num_picked = sum(
+                    1 for side in self.picks for slot in side if slot['champion_id'] is not None
+                )
 
                 if this_num_picked > self.num_picked:
                     updated = True
