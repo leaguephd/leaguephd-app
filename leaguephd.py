@@ -48,10 +48,11 @@ DDRAGON_PATCH_JS = r"""
 (function() {
     if (window.__lphd_ddragon_patched) return;
     if (typeof champion_data === 'undefined' || typeof $ === 'undefined') {
-        setTimeout(arguments.callee, 200);
+        setTimeout(arguments.callee, 100);
         return;
     }
     window.__lphd_ddragon_patched = true;
+    window.__lphd_ddragon_ready = false;
 
     const TAG_TO_ROLES = {
         'Marksman': ['ADC'],
@@ -63,6 +64,11 @@ DDRAGON_PATCH_JS = r"""
     };
 
     const custom_champ_roles = {};
+    // Track custom Data Dragon champions placed into pick slots so the backend never wipes them
+    const custom_picks = [
+        [null, null, null, null, null],
+        [null, null, null, null, null]
+    ];
 
     fetch('https://ddragon.leagueoflegends.com/api/versions.json')
         .then(r => r.json())
@@ -124,11 +130,35 @@ DDRAGON_PATCH_JS = r"""
                     }
                 }
             }
+            window.__lphd_ddragon_ready = true;
             if (typeof update_ban_portraits === 'function' && phase === 'ban') {
                 update_ban_portraits();
             }
         })
-        .catch(err => console.error('Data Dragon sync error:', err));
+        .catch(err => {
+            console.error('Data Dragon sync error:', err);
+            window.__lphd_ddragon_ready = true;
+        });
+
+    // Clear custom_picks slot when user clicks trashcan delete button
+    $(document).on('click', '.img-champion-overlay-delete', function() {
+        const s = parseInt($(this).parent().attr('data-side'));
+        const sl = parseInt($(this).parent().attr('data-slot'));
+        if (!isNaN(s) && !isNaN(sl)) {
+            custom_picks[s][sl] = null;
+        }
+    });
+
+    // Update custom_picks role when user manually clicks a lane radio button
+    $(document).on('change', '.label-role input', function() {
+        const labelObj = $(this).parent();
+        const s = parseInt(labelObj.attr('data-side'));
+        const sl = parseInt(labelObj.attr('data-slot'));
+        const r = labelObj.attr('data-role');
+        if (!isNaN(s) && !isNaN(sl) && custom_picks[s][sl]) {
+            custom_picks[s][sl].role = r;
+        }
+    });
 
     // Intercept $.ajax to support new champions in search and Lambda pick calculations
     const origAjax = $.ajax;
@@ -151,6 +181,13 @@ DDRAGON_PATCH_JS = r"""
         if (options && options.url === ajax_url && options.data) {
             try {
                 const payload = JSON.parse(options.data);
+
+                // 1) Strip custom Data Dragon champions from bans sent to Lambda
+                if (Array.isArray(payload.bans)) {
+                    payload.bans = payload.bans.filter(cid => !(champion_data[String(cid)] && champion_data[String(cid)].is_custom_ddragon));
+                }
+
+                // 2) Move custom Data Dragon champions from insert_list into custom_picks
                 const newInsertList = [];
                 if (Array.isArray(payload.insert_list)) {
                     for (const item of payload.insert_list) {
@@ -167,72 +204,122 @@ DDRAGON_PATCH_JS = r"""
                             }
                             const defaultRole = item.role || ((custom_champ_roles[cid] && custom_champ_roles[cid][0]) || 'MID');
                             if (s !== null && sl !== null) {
-                                payload.picks[s][sl] = {
+                                custom_picks[s][sl] = {
                                     champion_id: parseInt(cid),
-                                    role: defaultRole,
-                                    role_manually_set: true
-                                };
-                                picks[s][sl] = {
-                                    champion_id: parseInt(cid),
-                                    role: defaultRole,
-                                    role_manually_set: true
+                                    role: defaultRole
                                 };
                             }
                         } else {
+                            let s = item.side;
+                            let sl = item.slot;
+                            if (s !== null && sl !== null && custom_picks[s] && custom_picks[s][sl]) {
+                                custom_picks[s][sl] = null;
+                            }
                             newInsertList.push(item);
                         }
                     }
                     payload.insert_list = newInsertList;
-                    options.data = JSON.stringify(payload);
                 }
 
-                const origSuccess = options.success;
-                if (origSuccess) {
-                    options.success = function(json) {
-                        if (json && Array.isArray(json.suggestions)) {
-                            const pickedIds = new Set();
-                            const bannedIds = new Set((bans || []).filter(x => x !== null && x !== -1));
-                            const myTakenRoles = new Set();
-                            if (Array.isArray(json.selected)) {
-                                for (let side = 0; side < 2; side++) {
-                                    for (let slot = 0; slot < 5; slot++) {
-                                        const sc = json.selected[side][slot];
-                                        if (sc && sc.champion_id && sc.champion_id !== -1) {
-                                            pickedIds.add(parseInt(sc.champion_id));
-                                            if (side === my_side && sc.role) myTakenRoles.add(sc.role);
-                                        }
-                                    }
+                // 3) Strip custom Data Dragon champions from payload.picks sent to Lambda so Lambda never errors
+                if (Array.isArray(payload.picks)) {
+                    for (let side = 0; side < 2; side++) {
+                        for (let slot = 0; slot < 5; slot++) {
+                            const p = payload.picks[side][slot];
+                            if (p && p.champion_id && champion_data[String(p.champion_id)] && champion_data[String(p.champion_id)].is_custom_ddragon) {
+                                custom_picks[side][slot] = {
+                                    champion_id: parseInt(p.champion_id),
+                                    role: p.role || ((custom_champ_roles[String(p.champion_id)] && custom_champ_roles[String(p.champion_id)][0]) || 'MID')
+                                };
+                                payload.picks[side][slot] = {
+                                    champion_id: null,
+                                    role: null,
+                                    role_manually_set: false
+                                };
+                            }
+                        }
+                    }
+                }
+
+                options.data = JSON.stringify(payload);
+
+                const restoreCustomPicksAndSuggestions = function(json) {
+                    if (!json || !Array.isArray(json.selected)) return json;
+                    for (let side = 0; side < 2; side++) {
+                        for (let slot = 0; slot < 5; slot++) {
+                            const cp = custom_picks[side][slot];
+                            if (cp) {
+                                json.selected[side][slot] = {
+                                    champion_id: cp.champion_id,
+                                    role: cp.role || '',
+                                    width_beta: 50.0,
+                                    width_gamma: 50.0,
+                                    width_delta: 50.0
+                                };
+                            }
+                        }
+                    }
+                    if (Array.isArray(json.suggestions)) {
+                        const pickedIds = new Set();
+                        const bannedIds = new Set((bans || []).filter(x => x !== null && x !== -1));
+                        const myTakenRoles = new Set();
+                        for (let side = 0; side < 2; side++) {
+                            for (let slot = 0; slot < 5; slot++) {
+                                const sc = json.selected[side][slot];
+                                if (sc && sc.champion_id && sc.champion_id !== -1) {
+                                    pickedIds.add(parseInt(sc.champion_id));
+                                    if (side === my_side && sc.role) myTakenRoles.add(sc.role);
                                 }
                             }
-                            for (const [cid, cinfo] of Object.entries(champion_data)) {
-                                const numCid = parseInt(cid);
-                                if (cinfo.is_custom_ddragon && !pickedIds.has(numCid) && !bannedIds.has(numCid)) {
-                                    for (const r of (custom_champ_roles[cid] || ['MID'])) {
-                                        if (!myTakenRoles.has(r)) {
-                                            json.suggestions.push({
-                                                champion: { id: numCid, role: r },
-                                                popularity: 0.015,
-                                                strength: 50.0,
-                                                synergy: 50.0,
-                                                counter: 50.0,
-                                                risk: 3.0,
-                                                score: {
-                                                    score_composite: 5.0,
-                                                    synergy: { positives: '', negatives: '' },
-                                                    counter: { positives: '', negatives: '' },
-                                                    tag_strength: 0,
-                                                    tag_risk: 0,
-                                                    tag_popularity: 0
-                                                }
-                                            });
-                                        }
+                        }
+                        // Filter out suggestions for roles already taken on my_side by custom picks
+                        json.suggestions = json.suggestions.filter(s => !myTakenRoles.has(s.champion.role) && !pickedIds.has(parseInt(s.champion.id)) && !bannedIds.has(parseInt(s.champion.id)));
+                        for (const [cid, cinfo] of Object.entries(champion_data)) {
+                            const numCid = parseInt(cid);
+                            if (cinfo.is_custom_ddragon && !pickedIds.has(numCid) && !bannedIds.has(numCid)) {
+                                for (const r of (custom_champ_roles[cid] || ['MID'])) {
+                                    if (!myTakenRoles.has(r)) {
+                                        json.suggestions.push({
+                                            champion: { id: numCid, role: r },
+                                            popularity: 0.015,
+                                            strength: 50.0,
+                                            synergy: 50.0,
+                                            counter: 50.0,
+                                            risk: 3.0,
+                                            score: {
+                                                score_composite: 5.0,
+                                                synergy: { positives: '', negatives: '' },
+                                                counter: { positives: '', negatives: '' },
+                                                tag_strength: 0,
+                                                tag_risk: 0,
+                                                tag_popularity: 0
+                                            }
+                                        });
                                     }
                                 }
                             }
                         }
+                    }
+                    return json;
+                };
+
+                const origSuccess = options.success;
+                if (origSuccess) {
+                    options.success = function(json) {
+                        restoreCustomPicksAndSuggestions(json);
                         return origSuccess.apply(this, arguments);
                     };
                 }
+                const jqXHR = origAjax.apply(this, arguments);
+                const origThen = jqXHR.then;
+                jqXHR.then = function(doneFilter, failFilter) {
+                    const wrappedDone = doneFilter ? function(json) {
+                        restoreCustomPicksAndSuggestions(json);
+                        return doneFilter.apply(this, arguments);
+                    } : doneFilter;
+                    return origThen.call(this, wrappedDone, failFilter);
+                };
+                return jqXHR;
             } catch (e) {
                 console.error('Ajax patch error:', e);
             }
@@ -304,10 +391,10 @@ class MainWindow(QMainWindow):
         self.web_view.page().runJavaScript(DDRAGON_PATCH_JS)
         self.web_view.page().runJavaScript(f'''
             (function poll_app_call() {{
-                if (typeof app_call === "function" && typeof $ !== "undefined") {{
+                if (typeof app_call === "function" && typeof $ !== "undefined" && window.__lphd_ddragon_ready) {{
                     app_call({payload});
                 }} else {{
-                    setTimeout(poll_app_call, 200);
+                    setTimeout(poll_app_call, 100);
                 }}
             }})();
         ''')
